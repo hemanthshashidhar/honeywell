@@ -3,7 +3,10 @@ import ipaddress
 import os
 import queue
 import re
+import shutil
+import socket
 import subprocess
+import threading
 import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
@@ -188,6 +191,15 @@ html, body, [class*="css"], .stApp {
 .metric-good { color: var(--green); }
 .metric-cyan { color: var(--cyan); }
 
+.section-title {
+    margin: 1.35rem 0 0.8rem;
+    color: #b9f5ea;
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    font-family: 'Chakra Petch', sans-serif;
+    font-size: 0.88rem;
+}
+
 .table-wrap {
     max-height: 350px;
     overflow-y: auto;
@@ -276,12 +288,22 @@ html, body, [class*="css"], .stApp {
 
 AUTH_LOG = Path("/var/log/auth.log")
 HONEYPOT_FILE = Path.home() / "SECRET_CLASSIFIED.txt"
+TSHARK_BIN = shutil.which("tshark")
+NETWORK_INTERFACE = "any"
 REFRESH_INTERVAL_MS = 3000
 BRUTE_THRESHOLD = 5
 BRUTE_WINDOW = timedelta(minutes=5)
 MAX_AUTH_LINES = 500
 MAX_ALERTS = 8
 MAX_HONEY_EVENTS = 50
+MAX_PACKET_EVENTS = 1200
+PACKET_RETENTION = timedelta(minutes=10)
+PACKET_WINDOW = timedelta(minutes=1)
+PORT_SCAN_THRESHOLD = 10
+SYN_BURST_THRESHOLD = 40
+SSH_PACKET_THRESHOLD = 15
+ICMP_SPIKE_THRESHOLD = 25
+GLOBAL_PACKET_SPIKE_THRESHOLD = 250
 GEO_TIMEOUT = 3
 
 
@@ -302,13 +324,22 @@ INVALID_RE = re.compile(
 def ensure_state() -> None:
     defaults = {
         "honeypot_events": [],
+        "packet_events": [],
         "alerts": [],
         "observer_started": False,
         "observer_ref": None,
         "honeypot_queue": queue.Queue(),
+        "packet_queue": queue.Queue(),
         "seen_honeypot_event_keys": set(),
         "seen_alert_keys": set(),
         "geo_cache": {},
+        "packet_capture_started": False,
+        "packet_capture_process": None,
+        "packet_capture_thread": None,
+        "packet_capture_error": None,
+        "packet_capture_status": "idle",
+        "packet_capture_started_at": None,
+        "local_ips": set(),
         "monitor_started_at": time.time(),
     }
     for key, value in defaults.items():
@@ -375,6 +406,151 @@ def start_observer() -> None:
     observer.start()
     st.session_state.observer_ref = observer
     st.session_state.observer_started = True
+
+
+def detect_local_ips() -> set[str]:
+    ips = {"127.0.0.1", "::1"}
+
+    try:
+        result = subprocess.run(
+            ["hostname", "-I"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        for value in result.stdout.split():
+            try:
+                ipaddress.ip_address(value)
+            except ValueError:
+                continue
+            ips.add(value)
+    except OSError:
+        pass
+
+    try:
+        for entry in socket.getaddrinfo(socket.gethostname(), None):
+            value = entry[4][0]
+            try:
+                ipaddress.ip_address(value)
+            except ValueError:
+                continue
+            ips.add(value)
+    except socket.gaierror:
+        pass
+
+    return ips
+
+
+def packet_reader_worker(process: subprocess.Popen, event_queue: queue.Queue) -> None:
+    if process.stdout is None:
+        return
+
+    for raw_line in process.stdout:
+        line = raw_line.strip()
+        if not line:
+            continue
+        event_queue.put(line)
+
+
+def ensure_packet_capture() -> None:
+    if not st.session_state.local_ips:
+        st.session_state.local_ips = detect_local_ips()
+
+    process = st.session_state.packet_capture_process
+    if process is not None and process.poll() is not None:
+        stderr_output = ""
+        if process.stderr is not None:
+            stderr_output = process.stderr.read().strip()
+        st.session_state.packet_capture_process = None
+        st.session_state.packet_capture_thread = None
+        st.session_state.packet_capture_started = False
+        st.session_state.packet_capture_status = "error"
+        st.session_state.packet_capture_error = stderr_output or "tshark exited unexpectedly"
+
+    if st.session_state.packet_capture_started:
+        st.session_state.packet_capture_status = "active"
+        return
+
+    if not TSHARK_BIN:
+        st.session_state.packet_capture_status = "unavailable"
+        st.session_state.packet_capture_error = "tshark is not installed on this host"
+        return
+
+    command = [
+        TSHARK_BIN,
+        "-i",
+        NETWORK_INTERFACE,
+        "-l",
+        "-n",
+        "-Q",
+        "-f",
+        "ip",
+        "-T",
+        "fields",
+        "-E",
+        "separator=|",
+        "-E",
+        "occurrence=f",
+        "-e",
+        "frame.time_epoch",
+        "-e",
+        "ip.src",
+        "-e",
+        "ip.dst",
+        "-e",
+        "tcp.srcport",
+        "-e",
+        "tcp.dstport",
+        "-e",
+        "udp.srcport",
+        "-e",
+        "udp.dstport",
+        "-e",
+        "ip.proto",
+        "-e",
+        "frame.len",
+        "-e",
+        "tcp.flags.syn",
+        "-e",
+        "tcp.flags.ack",
+    ]
+
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+    except OSError as exc:
+        st.session_state.packet_capture_status = "error"
+        st.session_state.packet_capture_error = f"Unable to start tshark: {exc}"
+        return
+
+    thread = threading.Thread(
+        target=packet_reader_worker,
+        args=(process, st.session_state.packet_queue),
+        daemon=True,
+        name="securescope-packet-reader",
+    )
+    thread.start()
+
+    time.sleep(0.15)
+    if process.poll() is not None:
+        stderr_output = ""
+        if process.stderr is not None:
+            stderr_output = process.stderr.read().strip()
+        st.session_state.packet_capture_status = "error"
+        st.session_state.packet_capture_error = stderr_output or "tshark exited immediately"
+        return
+
+    st.session_state.packet_capture_process = process
+    st.session_state.packet_capture_thread = thread
+    st.session_state.packet_capture_started = True
+    st.session_state.packet_capture_status = "active"
+    st.session_state.packet_capture_error = None
+    st.session_state.packet_capture_started_at = time.time()
 
 
 def read_auth_log() -> list[str]:
@@ -528,6 +704,260 @@ def push_alert(category: str, message: str, dedupe_key: str) -> None:
     st.session_state.alerts = st.session_state.alerts[:MAX_ALERTS]
 
 
+def protocol_label(proto_number: str) -> str:
+    mapping = {
+        "1": "ICMP",
+        "6": "TCP",
+        "17": "UDP",
+        "58": "ICMPv6",
+    }
+    return mapping.get(proto_number, proto_number or "UNKNOWN")
+
+
+def classify_direction(src_ip: str, dst_ip: str) -> str:
+    local_ips = st.session_state.local_ips
+    if dst_ip in local_ips and src_ip not in local_ips:
+        return "INBOUND"
+    if src_ip in local_ips and dst_ip not in local_ips:
+        return "OUTBOUND"
+    if src_ip in local_ips and dst_ip in local_ips:
+        return "LOCAL"
+    return "UNKNOWN"
+
+
+def parse_packet_line(line: str) -> dict | None:
+    fields = line.split("|")
+    if len(fields) < 10:
+        return None
+
+    try:
+        timestamp = datetime.fromtimestamp(float(fields[0]))
+    except ValueError:
+        return None
+
+    src_ip = fields[1].strip()
+    dst_ip = fields[2].strip()
+    if not src_ip or not dst_ip:
+        return None
+
+    tcp_src, tcp_dst, udp_src, udp_dst = (field.strip() for field in fields[3:7])
+    src_port = tcp_src or udp_src or "-"
+    dst_port = tcp_dst or udp_dst or "-"
+    proto_number = fields[7].strip()
+    protocol = protocol_label(proto_number)
+
+    try:
+        length = int(fields[8].strip() or "0")
+    except ValueError:
+        length = 0
+
+    syn_flag = fields[9].strip() == "1"
+    ack_flag = fields[10].strip() == "1" if len(fields) > 10 else False
+    direction = classify_direction(src_ip, dst_ip)
+
+    return {
+        "timestamp": timestamp,
+        "time_label": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+        "src_ip": src_ip,
+        "dst_ip": dst_ip,
+        "src_port": src_port,
+        "dst_port": dst_port,
+        "protocol": protocol,
+        "length": length,
+        "syn": syn_flag,
+        "ack": ack_flag,
+        "direction": direction,
+    }
+
+
+def drain_packet_queue() -> None:
+    while True:
+        try:
+            raw_line = st.session_state.packet_queue.get_nowait()
+        except queue.Empty:
+            break
+
+        event = parse_packet_line(raw_line)
+        if not event:
+            continue
+        st.session_state.packet_events.insert(0, event)
+
+    if len(st.session_state.packet_events) > MAX_PACKET_EVENTS:
+        st.session_state.packet_events = st.session_state.packet_events[:MAX_PACKET_EVENTS]
+
+
+def prune_packet_events() -> None:
+    cutoff = datetime.now() - PACKET_RETENTION
+    st.session_state.packet_events = [
+        event for event in st.session_state.packet_events if event["timestamp"] >= cutoff
+    ]
+
+
+def collect_resource_metrics() -> dict:
+    cpu_cores = os.cpu_count() or 1
+    try:
+        load1, load5, _ = os.getloadavg()
+        cpu_load_pct = min(100.0, (load1 / max(cpu_cores, 1)) * 100)
+        load_label = f"{load1:.2f} / {load5:.2f}"
+    except OSError:
+        cpu_load_pct = 0.0
+        load_label = "Unavailable"
+
+    mem_total_kb = 0
+    mem_available_kb = 0
+    try:
+        with Path("/proc/meminfo").open(encoding="utf-8") as handle:
+            for line in handle:
+                key, _, value = line.partition(":")
+                amount = value.strip().split()[0] if value.strip() else "0"
+                if key == "MemTotal":
+                    mem_total_kb = int(amount)
+                elif key == "MemAvailable":
+                    mem_available_kb = int(amount)
+    except (OSError, ValueError):
+        mem_total_kb = 0
+        mem_available_kb = 0
+
+    if mem_total_kb:
+        mem_used_pct = ((mem_total_kb - mem_available_kb) / mem_total_kb) * 100
+        mem_label = f"{(mem_total_kb - mem_available_kb) / 1024 / 1024:.1f} GB"
+    else:
+        mem_used_pct = 0.0
+        mem_label = "Unavailable"
+
+    disk_total, disk_used, _ = shutil.disk_usage(Path.home())
+    disk_used_pct = (disk_used / disk_total) * 100 if disk_total else 0.0
+
+    return {
+        "cpu_load_pct": cpu_load_pct,
+        "load_label": load_label,
+        "memory_used_pct": mem_used_pct,
+        "memory_label": mem_label,
+        "disk_used_pct": disk_used_pct,
+        "disk_label": f"{disk_used / 1024 / 1024 / 1024:.1f} GB",
+        "cpu_cores": cpu_cores,
+    }
+
+
+def analyze_packets() -> dict:
+    ensure_packet_capture()
+    drain_packet_queue()
+    prune_packet_events()
+
+    now = datetime.now()
+    recent_cutoff = now - PACKET_WINDOW
+    recent_events = [
+        event for event in st.session_state.packet_events if event["timestamp"] >= recent_cutoff
+    ]
+    suspicious_window = [
+        event for event in recent_events if event["direction"] in {"INBOUND", "LOCAL", "UNKNOWN"}
+    ]
+
+    events_by_src = defaultdict(list)
+    for event in suspicious_window:
+        events_by_src[event["src_ip"]].append(event)
+
+    anomalies = []
+    for src_ip, events in events_by_src.items():
+        last_seen = max(event["timestamp"] for event in events)
+        distinct_ports = {event["dst_port"] for event in events if event["dst_port"] != "-"}
+        syn_count = sum(
+            1
+            for event in events
+            if event["protocol"] == "TCP" and event["syn"] and not event["ack"]
+        )
+        ssh_hits = sum(1 for event in events if event["dst_port"] == "22")
+        icmp_hits = sum(1 for event in events if event["protocol"] in {"ICMP", "ICMPv6"})
+
+        if len(distinct_ports) >= PORT_SCAN_THRESHOLD:
+            anomalies.append(
+                {
+                    "severity": "HIGH",
+                    "src_ip": src_ip,
+                    "kind": "Port Scan",
+                    "detail": f"{len(distinct_ports)} destination ports in 60s",
+                    "count": len(events),
+                    "last_seen": last_seen,
+                }
+            )
+
+        if syn_count >= SYN_BURST_THRESHOLD:
+            anomalies.append(
+                {
+                    "severity": "HIGH",
+                    "src_ip": src_ip,
+                    "kind": "SYN Burst",
+                    "detail": f"{syn_count} TCP SYN packets in 60s",
+                    "count": syn_count,
+                    "last_seen": last_seen,
+                }
+            )
+
+        if ssh_hits >= SSH_PACKET_THRESHOLD:
+            anomalies.append(
+                {
+                    "severity": "MEDIUM",
+                    "src_ip": src_ip,
+                    "kind": "SSH Hammering",
+                    "detail": f"{ssh_hits} packets to port 22 in 60s",
+                    "count": ssh_hits,
+                    "last_seen": last_seen,
+                }
+            )
+
+        if icmp_hits >= ICMP_SPIKE_THRESHOLD:
+            anomalies.append(
+                {
+                    "severity": "MEDIUM",
+                    "src_ip": src_ip,
+                    "kind": "ICMP Spike",
+                    "detail": f"{icmp_hits} ICMP packets in 60s",
+                    "count": icmp_hits,
+                    "last_seen": last_seen,
+                }
+            )
+
+    if len(suspicious_window) >= GLOBAL_PACKET_SPIKE_THRESHOLD:
+        last_seen = max(event["timestamp"] for event in suspicious_window)
+        anomalies.append(
+            {
+                "severity": "HIGH",
+                "src_ip": "multiple",
+                "kind": "Traffic Spike",
+                "detail": f"{len(suspicious_window)} suspicious packets in 60s",
+                "count": len(suspicious_window),
+                "last_seen": last_seen,
+            }
+        )
+
+    for anomaly in anomalies:
+        push_alert(
+            category="network",
+            message=f"{anomaly['kind']} from {anomaly['src_ip']}: {anomaly['detail']}",
+            dedupe_key=(
+                f"network:{anomaly['kind']}:{anomaly['src_ip']}:"
+                f"{anomaly['last_seen'].replace(second=0, microsecond=0).isoformat()}"
+            ),
+        )
+
+    top_sources = Counter(event["src_ip"] for event in suspicious_window).most_common(8)
+    top_ports = Counter(
+        event["dst_port"] for event in suspicious_window if event["dst_port"] != "-"
+    ).most_common(8)
+    protocol_mix = Counter(event["protocol"] for event in recent_events).most_common(6)
+
+    return {
+        "recent_events": recent_events,
+        "suspicious_window": suspicious_window,
+        "anomalies": sorted(anomalies, key=lambda item: item["last_seen"], reverse=True),
+        "top_sources": top_sources,
+        "top_ports": top_ports,
+        "protocol_mix": protocol_mix,
+        "capture_status": st.session_state.packet_capture_status,
+        "capture_error": st.session_state.packet_capture_error,
+    }
+
+
 def geolocate_ip(ip: str) -> dict | None:
     cached = st.session_state.geo_cache.get(ip)
     if cached is not None:
@@ -595,6 +1025,7 @@ def analyze() -> dict:
     drain_honeypot_queue()
     auth_events = parse_auth_events(read_auth_log())
     brute_force = detect_bruteforce(auth_events)
+    packet_analysis = analyze_packets()
 
     for ip, detail in brute_force.items():
         push_alert(
@@ -615,6 +1046,8 @@ def analyze() -> dict:
         "auth_events": auth_events,
         "brute_force": brute_force,
         "map_rows": build_map_rows(auth_events),
+        "packet_analysis": packet_analysis,
+        "resource_metrics": collect_resource_metrics(),
     }
 
 
@@ -716,6 +1149,154 @@ def render_map(map_rows: list[dict]) -> None:
     st.markdown(f'<div class="pill-row">{"".join(pills)}</div>', unsafe_allow_html=True)
 
 
+def render_resource_panel(resource_metrics: dict) -> None:
+    st.markdown(
+        f"""
+<div class="metrics">
+    <div class="metric">
+        <div class="metric-value metric-cyan">{resource_metrics['cpu_load_pct']:.0f}%</div>
+        <div class="metric-label">CPU Load ({html.escape(resource_metrics['load_label'])})</div>
+    </div>
+    <div class="metric">
+        <div class="metric-value metric-warn">{resource_metrics['memory_used_pct']:.0f}%</div>
+        <div class="metric-label">Memory Used ({html.escape(resource_metrics['memory_label'])})</div>
+    </div>
+    <div class="metric">
+        <div class="metric-value metric-good">{resource_metrics['disk_used_pct']:.0f}%</div>
+        <div class="metric-label">Home Disk Used ({html.escape(resource_metrics['disk_label'])})</div>
+    </div>
+    <div class="metric">
+        <div class="metric-value metric-cyan">{resource_metrics['cpu_cores']}</div>
+        <div class="metric-label">CPU Cores</div>
+    </div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+
+def render_network_anomaly_table(anomalies: list[dict], capture_status: str, capture_error: str | None) -> None:
+    if capture_status != "active":
+        message = capture_error or "Packet capture is not active."
+        st.markdown(f'<div class="empty">{html.escape(message)}</div>', unsafe_allow_html=True)
+        return
+
+    if not anomalies:
+        st.markdown(
+            '<div class="empty">No packet anomalies detected in the last 60 seconds.</div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    rows = []
+    for anomaly in anomalies[:20]:
+        severity_class = "badge-brute" if anomaly["severity"] == "HIGH" else "badge-invalid"
+        rows.append(
+            f"""
+<tr>
+    <td>{html.escape(anomaly['last_seen'].strftime("%Y-%m-%d %H:%M:%S"))}</td>
+    <td><span class="badge {severity_class}">{html.escape(anomaly['severity'])}</span></td>
+    <td>{html.escape(anomaly['src_ip'])}</td>
+    <td>{html.escape(anomaly['kind'])}</td>
+    <td>{html.escape(anomaly['detail'])}</td>
+</tr>
+"""
+        )
+
+    st.markdown(
+        f"""
+<div class="table-wrap">
+    <table class="log-table">
+        <thead>
+            <tr><th>Time</th><th>Severity</th><th>Source IP</th><th>Type</th><th>Detail</th></tr>
+        </thead>
+        <tbody>{''.join(rows)}</tbody>
+    </table>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+
+def render_packet_table(packet_events: list[dict], capture_status: str, capture_error: str | None) -> None:
+    if capture_status != "active":
+        message = capture_error or "Packet capture is not active."
+        st.markdown(f'<div class="empty">{html.escape(message)}</div>', unsafe_allow_html=True)
+        return
+
+    if not packet_events:
+        st.markdown(
+            '<div class="empty">Waiting for IP packets. Generate traffic from another system to populate this panel.</div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    rows = []
+    for event in packet_events[:30]:
+        rows.append(
+            f"""
+<tr>
+    <td>{html.escape(event['time_label'])}</td>
+    <td>{html.escape(event['src_ip'])}</td>
+    <td>{html.escape(event['dst_ip'])}</td>
+    <td>{html.escape(event['protocol'])}</td>
+    <td>{html.escape(event['dst_port'])}</td>
+    <td>{html.escape(event['direction'])}</td>
+</tr>
+"""
+        )
+
+    st.markdown(
+        f"""
+<div class="table-wrap">
+    <table class="log-table">
+        <thead>
+            <tr><th>Time</th><th>Source IP</th><th>Destination IP</th><th>Protocol</th><th>Dst Port</th><th>Direction</th></tr>
+        </thead>
+        <tbody>{''.join(rows)}</tbody>
+    </table>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+
+def render_network_summary(packet_analysis: dict) -> None:
+    recent_events = packet_analysis["recent_events"]
+    suspicious_window = packet_analysis["suspicious_window"]
+    anomalies = packet_analysis["anomalies"]
+
+    st.markdown(
+        f"""
+<div class="metrics">
+    <div class="metric">
+        <div class="metric-value metric-cyan">{len(recent_events)}</div>
+        <div class="metric-label">Packets Last 60s</div>
+    </div>
+    <div class="metric">
+        <div class="metric-value metric-danger">{len(anomalies)}</div>
+        <div class="metric-label">Active Anomalies</div>
+    </div>
+    <div class="metric">
+        <div class="metric-value metric-warn">{len({event['src_ip'] for event in suspicious_window})}</div>
+        <div class="metric-label">Active Source IPs</div>
+    </div>
+    <div class="metric">
+        <div class="metric-value metric-good">{packet_analysis['capture_status'].upper()}</div>
+        <div class="metric-label">Capture Status</div>
+    </div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+    if packet_analysis["capture_error"]:
+        st.markdown(
+            f'<div class="subtle">Capture issue: {html.escape(packet_analysis["capture_error"])}</div>',
+            unsafe_allow_html=True,
+        )
+
+
 ensure_state()
 ensure_honeypot()
 start_observer()
@@ -724,6 +1305,8 @@ analysis = analyze()
 auth_events = analysis["auth_events"]
 brute_force = analysis["brute_force"]
 map_rows = analysis["map_rows"]
+packet_analysis = analysis["packet_analysis"]
+resource_metrics = analysis["resource_metrics"]
 
 failed_count = sum(event["status"] in {"FAILED", "INVALID"} for event in auth_events)
 success_count = sum(event["status"] == "SUCCESS" for event in auth_events)
@@ -735,8 +1318,8 @@ st.markdown(
     f"""
 <div class="hero">
     <h1>SecureScope</h1>
-    <div class="hero-sub">SSH login monitoring, brute force detection, honeypot watch, attacker geolocation, real-time alerts</div>
-    <div class="hero-status"><span class="hero-status-dot"></span>Monitoring {html.escape(str(AUTH_LOG))} and {html.escape(HONEYPOT_FILE.name)}</div>
+    <div class="hero-sub">SSH login monitoring, host visibility, honeypot watch, packet anomaly detection, attacker geolocation, real-time alerts</div>
+    <div class="hero-status"><span class="hero-status-dot"></span>Monitoring {html.escape(str(AUTH_LOG))}, {html.escape(HONEYPOT_FILE.name)}, and live packets on {html.escape(NETWORK_INTERFACE)}</div>
 </div>
 """,
     unsafe_allow_html=True,
@@ -745,8 +1328,10 @@ st.markdown(
 for alert in st.session_state.alerts[:3]:
     st.markdown(
         f'<div class="alert-banner">[{html.escape(alert["time_label"])}] {html.escape(alert["message"])}</div>',
-        unsafe_allow_html=True,
-    )
+    unsafe_allow_html=True,
+)
+
+st.markdown('<div class="section-title">SSH And Host Monitoring</div>', unsafe_allow_html=True)
 
 st.markdown(
     f"""
@@ -772,9 +1357,9 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-left_col, right_col = st.columns([1.2, 1], gap="medium")
+ssh_col, honey_col, resource_col = st.columns([1.15, 0.95, 0.9], gap="medium")
 
-with left_col:
+with ssh_col:
     st.markdown('<div class="panel"><div class="panel-title">SSH Login Monitor</div>', unsafe_allow_html=True)
     render_auth_table(auth_events, brute_force)
     if brute_force:
@@ -785,7 +1370,7 @@ with left_col:
         st.markdown(f'<div class="pill-row">{brute_items}</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
-with right_col:
+with honey_col:
     st.markdown('<div class="panel"><div class="panel-title">Honeypot File Monitor</div>', unsafe_allow_html=True)
     st.markdown(
         f'<div class="subtle">Watching <code>{html.escape(str(HONEYPOT_FILE))}</code></div>',
@@ -794,7 +1379,20 @@ with right_col:
     render_honeypot_table()
     st.markdown('</div>', unsafe_allow_html=True)
 
-st.markdown('<div style="height: 1rem;"></div>', unsafe_allow_html=True)
+with resource_col:
+    st.markdown('<div class="panel"><div class="panel-title">Host Resource Monitor</div>', unsafe_allow_html=True)
+    render_resource_panel(resource_metrics)
+    st.markdown(
+        f"""
+<div class="subtle">
+    Monitor uptime: {html.escape(uptime)}<br>
+    Last refresh: {html.escape(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))}<br>
+    Local IPs: <code>{html.escape(', '.join(sorted(st.session_state.local_ips)) or 'Unavailable')}</code>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+    st.markdown('</div>', unsafe_allow_html=True)
 
 map_col, insight_col = st.columns([1.25, 0.75], gap="medium")
 
@@ -819,13 +1417,53 @@ with insight_col:
 
     st.markdown(
         f"""
-<div class="subtle" style="margin-top:1rem;">
-    Monitor uptime: {html.escape(uptime)}<br>
-    Last refresh: {html.escape(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))}<br>
-    Active interface observed earlier: <code>wlp3s0</code>
-</div>
+<div class="subtle" style="margin-top:1rem;">Correlate these IPs with the packet monitoring section below to confirm whether they are scanning, flooding, or only attempting SSH logins.</div>
 """,
         unsafe_allow_html=True,
+    )
+    st.markdown('</div>', unsafe_allow_html=True)
+
+st.markdown('<div class="section-title">Network Packet Monitoring</div>', unsafe_allow_html=True)
+
+st.markdown('<div class="panel"><div class="panel-title">Packet Capture Summary</div>', unsafe_allow_html=True)
+render_network_summary(packet_analysis)
+if packet_analysis["top_sources"]:
+    source_pills = "".join(
+        f'<div class="pill">{html.escape(ip)} · {count} packets</div>'
+        for ip, count in packet_analysis["top_sources"]
+    )
+    st.markdown(f'<div class="pill-row">{source_pills}</div>', unsafe_allow_html=True)
+if packet_analysis["top_ports"]:
+    port_pills = "".join(
+        f'<div class="pill">Port {html.escape(port)} · {count} hits</div>'
+        for port, count in packet_analysis["top_ports"]
+    )
+    st.markdown(f'<div class="pill-row">{port_pills}</div>', unsafe_allow_html=True)
+if packet_analysis["protocol_mix"]:
+    proto_pills = "".join(
+        f'<div class="pill">{html.escape(proto)} · {count}</div>'
+        for proto, count in packet_analysis["protocol_mix"]
+    )
+    st.markdown(f'<div class="pill-row">{proto_pills}</div>', unsafe_allow_html=True)
+st.markdown('</div>', unsafe_allow_html=True)
+
+network_left, network_right = st.columns([1, 1], gap="medium")
+
+with network_left:
+    st.markdown('<div class="panel"><div class="panel-title">Detected Packet Anomalies</div>', unsafe_allow_html=True)
+    render_network_anomaly_table(
+        packet_analysis["anomalies"],
+        packet_analysis["capture_status"],
+        packet_analysis["capture_error"],
+    )
+    st.markdown('</div>', unsafe_allow_html=True)
+
+with network_right:
+    st.markdown('<div class="panel"><div class="panel-title">Recent Packet Activity</div>', unsafe_allow_html=True)
+    render_packet_table(
+        packet_analysis["recent_events"],
+        packet_analysis["capture_status"],
+        packet_analysis["capture_error"],
     )
     st.markdown('</div>', unsafe_allow_html=True)
 
