@@ -233,15 +233,3 @@ The current implementation uses fixed values defined in code:
 - There are no automated tests yet
 - The project is a single-file application, so configuration and UI logic are tightly coupled
 
-## Possible Next Improvements
-
-- Move hard-coded settings into environment variables or a config file
-- Support more auth log formats and distro variants
-- Add persistent event storage
-- Add filtering, search, and export in the dashboard
-- Add tests for parsing and brute-force detection
-- Split the code into modules for UI, parsing, detection, and integrations
-
-## Repository Context
-
-This repository currently contains one main application file and a Python virtual environment directory. The virtual environment should generally not be committed to GitHub. If you plan to publish this repository, keep the tracked source files minimal and add a `.gitignore` for environment and cache artifacts if needed.
